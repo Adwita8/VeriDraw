@@ -13,6 +13,7 @@ pub mod event_raffle {
         event_id: u64,
         max_participants: u32,
         winner_count: u32,
+        registration_fee: u64,
     ) -> Result<()> {
         let event = &mut ctx.accounts.event;
 
@@ -24,6 +25,8 @@ pub mod event_raffle {
         event.event_id = event_id;
         event.max_participants = max_participants;
         event.winner_count = winner_count;
+        // Fee is stored in lamports; 0 means free registration
+        event.registration_fee = registration_fee;
         event.participant_count = 0;
         event.state = EventState::Created;
         event.randomness_account = Pubkey::default();
@@ -58,12 +61,43 @@ pub mod event_raffle {
             ErrorCode::EventFull
         );
 
+        // ──────────────────────────────────────────────────────────────────
+        // Registration fee: transfer lamports from attendee → organizer.
+        // If the fee is 0 (free event) this block is skipped entirely.
+        // ──────────────────────────────────────────────────────────────────
+        let fee = event.registration_fee;
+        if fee > 0 {
+            let attendee_lamports = ctx.accounts.attendee.to_account_info().lamports();
+            require!(attendee_lamports >= fee, ErrorCode::InsufficientFunds);
+
+            let transfer_ix = anchor_lang::solana_program::system_instruction::transfer(
+                &ctx.accounts.attendee.key(),
+                &ctx.accounts.organizer.key(),
+                fee,
+            );
+            anchor_lang::solana_program::program::invoke(
+                &transfer_ix,
+                &[
+                    ctx.accounts.attendee.to_account_info(),
+                    ctx.accounts.organizer.to_account_info(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+            )?;
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Participation badge cNFT is minted off-chain by the client after
+        // this instruction confirms. The on-chain Entry PDA serves as the
+        // proof anchor that the client reads to trigger the Bubblegum mint.
+        // ──────────────────────────────────────────────────────────────────
         let entry = &mut ctx.accounts.entry;
 
         entry.event = event.key();
         entry.attendee = ctx.accounts.attendee.key();
         entry.index = event.participant_count;
         entry.is_winner = false;
+        entry.participation_cnft_minted = false;
+        entry.winner_cnft_minted = false;
 
         event.participant_count += 1;
 
@@ -200,6 +234,12 @@ pub mod event_raffle {
         winner_pda.participant_index = entry.index;
         winner_pda.winner_index = winner_index;
 
+        // ──────────────────────────────────────────────────────────────────
+        // Winner cNFT is minted off-chain by the client after this
+        // instruction confirms. The client reads winner_pda to trigger the
+        // Bubblegum mint with "Status: Winner" metadata.
+        // ──────────────────────────────────────────────────────────────────
+
         Ok(())
     }
 
@@ -259,11 +299,21 @@ pub struct OpenRegistration<'info> {
 
 #[derive(Accounts)]
 pub struct Register<'info> {
+    /// The participant paying the registration fee and rent.
     #[account(mut)]
     pub attendee: Signer<'info>,
 
     #[account(mut)]
     pub event: Account<'info, Event>,
+
+    /// The organizer's SOL account — receives the registration fee.
+    /// Validated at runtime that it matches event.organizer.
+    #[account(
+        mut,
+        constraint = organizer.key() == event.organizer @ ErrorCode::Unauthorized
+    )]
+    /// CHECK: address equality is enforced by the constraint above.
+    pub organizer: UncheckedAccount<'info>,
 
     #[account(
         init,
@@ -397,6 +447,9 @@ pub struct Event {
     pub event_id: u64,
     pub max_participants: u32,
     pub winner_count: u32,
+    /// Registration fee in lamports. 0 = free event.
+    /// Set once at initialization and immutable thereafter.
+    pub registration_fee: u64,
     pub participant_count: u32,
     pub state: EventState,
     pub randomness_account: Pubkey,
@@ -411,6 +464,10 @@ pub struct Entry {
     pub attendee: Pubkey,
     pub index: u32,
     pub is_winner: bool,
+    /// True once the off-chain client has minted the participation badge cNFT.
+    pub participation_cnft_minted: bool,
+    /// True once the off-chain client has minted the winner cNFT.
+    pub winner_cnft_minted: bool,
 }
 
 #[account]
@@ -465,4 +522,7 @@ pub enum ErrorCode {
 
     #[msg("Not all winners have been resolved")]
     WinnersNotAllResolved,
+
+    #[msg("Participant does not have enough SOL to cover the registration fee")]
+    InsufficientFunds,
 }

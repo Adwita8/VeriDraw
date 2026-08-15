@@ -16,6 +16,13 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Configuration
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Registration fee in lamports (0.05 SOL). Set to 0 for a free event. */
+const REGISTRATION_FEE_LAMPORTS = new anchor.BN(50_000_000); // 0.05 SOL
+
 // Load wallet keypair from local solana config
 function loadWalletKeypair(): Keypair {
   const home = os.homedir();
@@ -66,14 +73,17 @@ async function main() {
 
   console.log(`Event ID: ${eventId.toString()}`);
   console.log(`Event PDA: ${eventPda.toBase58()}`);
+  console.log(`Registration Fee: ${REGISTRATION_FEE_LAMPORTS.toNumber() / 1e9} SOL per participant`);
 
   const maxParticipants = 10;
   const winnerCount = 3;
 
-  // 1. Initialize Event
+  // ─────────────────────────────────────────────────────────────────────────
+  // 1. Initialize Event (with registration_fee)
+  // ─────────────────────────────────────────────────────────────────────────
   console.log("\n--- Step 1: Initializing Event ---");
   const initTx = await program.methods
-    .initializeEvent(eventId, maxParticipants, winnerCount)
+    .initializeEvent(eventId, maxParticipants, winnerCount, REGISTRATION_FEE_LAMPORTS)
     .accounts({
       organizer: organizer.publicKey,
       event: eventPda,
@@ -83,7 +93,9 @@ async function main() {
     .rpc();
   console.log(`Event Initialized. Tx: ${initTx}`);
 
+  // ─────────────────────────────────────────────────────────────────────────
   // 2. Open Registration
+  // ─────────────────────────────────────────────────────────────────────────
   console.log("\n--- Step 2: Opening Registration ---");
   const openTx = await program.methods
     .openRegistration()
@@ -95,7 +107,11 @@ async function main() {
     .rpc();
   console.log(`Registration Opened. Tx: ${openTx}`);
 
-  // 3. Register Multiple Participants (e.g. 5 participants)
+  // ─────────────────────────────────────────────────────────────────────────
+  // 3. Register Multiple Participants
+  //    Each participant pays the registration fee → organizer wallet.
+  //    After confirmation a Participation Badge cNFT is minted off-chain.
+  // ─────────────────────────────────────────────────────────────────────────
   console.log(`\n--- Step 3: Registering ${winnerCount + 2} Participants ---`);
   const participants: Keypair[] = [];
   const entryPdas: PublicKey[] = [];
@@ -105,12 +121,14 @@ async function main() {
     participants.push(participant);
     console.log(`Registering Participant ${i + 1}: ${participant.publicKey.toBase58()}`);
 
-    // Airdrop SOL to participant to pay for rent
+    // Airdrop enough SOL to cover the registration fee + rent for the Entry PDA
+    const airdropAmount = REGISTRATION_FEE_LAMPORTS.toNumber() + 2_000_000_000; // fee + 2 SOL for rent/tx
     const airdropSig = await connection.requestAirdrop(
       participant.publicKey,
-      1_000_000_000
+      airdropAmount
     );
     await connection.confirmTransaction(airdropSig, "confirmed");
+    console.log(`  Airdropped ${airdropAmount / 1e9} SOL to participant.`);
 
     const [entryPda] = PublicKey.findProgramAddressSync(
       [Buffer.from("entry"), eventPda.toBuffer(), participant.publicKey.toBuffer()],
@@ -123,15 +141,31 @@ async function main() {
       .accounts({
         attendee: participant.publicKey,
         event: eventPda,
+        // The organizer account receives the registration fee on-chain
+        organizer: organizer.publicKey,
         entry: entryPda,
         systemProgram: SystemProgram.programId,
       })
       .signers([participant])
       .rpc();
-    console.log(`Participant ${i + 1} Registered. Tx: ${regTx}`);
+    console.log(`  Participant ${i + 1} Registered. Tx: ${regTx}`);
+    console.log(`  Fee of ${REGISTRATION_FEE_LAMPORTS.toNumber() / 1e9} SOL transferred → organizer.`);
+
+    // ── Mint Participation Badge cNFT (off-chain, triggered immediately after registration) ──
+    await mintParticipationCNFT(
+      connection,
+      organizer,
+      participant.publicKey,
+      `Event-${eventId.toString()}`,
+      eventId,
+      i,
+      useDevnet
+    );
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
   // 4. Close Registration
+  // ─────────────────────────────────────────────────────────────────────────
   console.log("\n--- Step 4: Closing Registration ---");
   const closeTx = await program.methods
     .closeRegistration()
@@ -143,7 +177,9 @@ async function main() {
     .rpc();
   console.log(`Registration Closed. Tx: ${closeTx}`);
 
+  // ─────────────────────────────────────────────────────────────────────────
   // 5. Request/Commit Switchboard Randomness
+  // ─────────────────────────────────────────────────────────────────────────
   console.log("\n--- Step 5: Committing/Requesting Randomness ---");
   const sbProgram = await sb.AnchorUtils.loadProgramFromConnection(connection, wallet);
 
@@ -185,7 +221,9 @@ async function main() {
   const tx1Sig = await sendAndConfirmTransaction(connection, tx1, [organizer, rngKp]);
   console.log(`Randomness requested/committed. Tx: ${tx1Sig}`);
 
+  // ─────────────────────────────────────────────────────────────────────────
   // 6. Wait for Oracle to resolve randomness
+  // ─────────────────────────────────────────────────────────────────────────
   console.log("\n--- Step 6: Waiting for Switchboard Oracle to resolve randomness ---");
   let revealIx;
   for (let i = 0; i < 20; i++) {
@@ -203,7 +241,9 @@ async function main() {
     throw new Error("Timeout waiting for Switchboard Oracle to resolve randomness.");
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
   // 7. Atomically Reveal and Select Winners
+  // ─────────────────────────────────────────────────────────────────────────
   console.log("\n--- Step 7: Atomically revealing randomness and selecting winners ---");
   const selectWinnersIx = await program.methods
     .selectWinners()
@@ -218,18 +258,20 @@ async function main() {
   const tx2Sig = await sendAndConfirmTransaction(connection, tx2, [organizer]);
   console.log(`Randomness revealed and winners selected! Tx: ${tx2Sig}`);
 
+  // ─────────────────────────────────────────────────────────────────────────
   // 8. Fetch event state & winner indices
+  // ─────────────────────────────────────────────────────────────────────────
   const finalEvent = await program.account.event.fetch(eventPda);
   console.log("\n--- Step 8: Verifying Winner Selections ---");
   console.log("Event state (Enum index):", finalEvent.state);
   console.log("Winners selected (indices):", finalEvent.winners.map((w: any) => w.index));
 
-  // 9. Resolve Winners on-chain
+  // ─────────────────────────────────────────────────────────────────────────
+  // 9. Resolve Winners on-chain + Mint Winner cNFT (off-chain)
+  // ─────────────────────────────────────────────────────────────────────────
   console.log("\n--- Step 9: Resolving Winner attendee mappings and PDAs on-chain ---");
   for (let i = 0; i < finalEvent.winners.length; i++) {
     const winnerInfo = finalEvent.winners[i];
-    // Find the participant keypair corresponding to winnerInfo.index
-    // We can query each entry to find the one matching the index
     let winnerAttendee: Keypair | null = null;
     let winnerEntryPda: PublicKey | null = null;
 
@@ -275,12 +317,22 @@ async function main() {
     const winnerPdaData = await program.account.winner.fetch(winnerPda);
     console.log(`Winner PDA on-chain confirmation: Winner Index ${winnerPdaData.winner_index} -> ${winnerPdaData.attendee.toBase58()}`);
     
-    // 10. Mint/Issue Compressed NFT to Winner
-    await mintWinnerCNFT(connection, organizer, winnerAttendee.publicKey, `Raffle-${eventId.toString()}`, eventId, useDevnet);
+    // ── Mint Winner cNFT (off-chain, triggered after resolve_winner confirms) ──
+    await mintWinnerCNFT(
+      connection,
+      organizer,
+      winnerAttendee.publicKey,
+      `Event-${eventId.toString()}`,
+      eventId,
+      i,
+      useDevnet
+    );
   }
 
-  // 11. Complete Event Lifecycle
-  console.log("\n--- Step 11: Finalizing Event ---");
+  // ─────────────────────────────────────────────────────────────────────────
+  // 10. Complete Event Lifecycle
+  // ─────────────────────────────────────────────────────────────────────────
+  console.log("\n--- Step 10: Finalizing Event ---");
   const completeTx = await program.methods
     .completeEvent()
     .accounts({
@@ -291,111 +343,171 @@ async function main() {
     .rpc();
   console.log(`Event Completed. Tx: ${completeTx}`);
 
-  // Fetch final completed event state
   const completedEvent = await program.account.event.fetch(eventPda);
   console.log("\n--- Final Event State Verification ---");
   console.log("Event state (Completed index = 5):", completedEvent.state);
   console.log("Winners list resolved details:", completedEvent.winners);
+
+  console.log(`\n✅ Summary:`);
+  console.log(`   • ${participants.length} participants registered`);
+  console.log(`   • ${participants.length} Participation Badge cNFTs minted (one per registrant)`);
+  console.log(`   • ${finalEvent.winners.length} Winner cNFTs minted (VRF-selected winners only)`);
+  console.log(`   • Total fees collected: ${(REGISTRATION_FEE_LAMPORTS.toNumber() * participants.length) / 1e9} SOL → organizer`);
 }
 
-async function mintWinnerCNFT(
+// ─────────────────────────────────────────────────────────────────────────────
+// mintParticipationCNFT — minted to EVERY registrant at the time of registration.
+// Represents a "Participation Badge" — proof that the wallet entered the raffle.
+// ─────────────────────────────────────────────────────────────────────────────
+async function mintParticipationCNFT(
   connection: Connection,
   organizer: Keypair,
-  winnerPubkey: PublicKey,
+  participantPubkey: PublicKey,
   eventName: string,
   eventId: anchor.BN,
+  participantIndex: number,
   useDevnet: boolean
 ) {
-  console.log(`\n--- Compressed NFT: Issuing to ${winnerPubkey.toBase58()} ---`);
+  console.log(`\n  [cNFT:Badge] Minting Participation Badge → ${participantPubkey.toBase58()}`);
 
   if (!useDevnet) {
-    console.log("[Simulation] Running on localnet. Skipping live Metaplex Bubblegum mint because the Bubblegum program is not deployed on localnet.");
-    console.log("[Simulation] In production (Devnet/Mainnet), the following code runs to mint a cNFT to the winner:");
+    console.log("  [Simulation] Localnet: Skipping live Bubblegum mint for participation badge.");
+    console.log("  [Simulation] On Devnet/Mainnet the following would run:");
     console.log(`
-      const umi = createUmi("${connection.rpcEndpoint}")
-        .use(keypairIdentity(fromWeb3JsKeypair(organizer)))
-        .use(mplBubblegum());
-        
-      // 1. Create a Merkle Tree for state compression
-      const merkleTreeKeypair = generateSigner(umi);
-      const treeBuilder = await createTree(umi, {
-        merkleTree: merkleTreeKeypair,
-        maxDepth: 14,
-        maxBufferSize: 64,
-      });
-      await treeBuilder.sendAndConfirm(umi);
-      
-      // 2. Mint the cNFT representing proof of winning to the winner's wallet
-      const { signature } = await mintV1(umi, {
-        leafOwner: publicKey("${winnerPubkey.toBase58()}"),
-        merkleTree: merkleTreeKeypair.publicKey,
+      mintV1(umi, {
+        leafOwner: "${participantPubkey.toBase58()}",
         metadata: {
-          name: "Event Raffle Winner - ${eventName}",
-          symbol: "RAFFLE",
-          uri: "https://arweave.net/example-metadata-uri",
-          sellerFeeBasisPoints: 0,
-          creators: [
-            { address: umi.identity.publicKey, verified: true, share: 100 },
-          ],
+          name: "Participation Badge - ${eventName}",
+          symbol: "PART",
+          uri: "https://arweave.net/participation-metadata-uri",
           attributes: [
             { trait_type: "Event ID", value: "${eventId.toString()}" },
-            { trait_type: "Status", value: "Winner" },
+            { trait_type: "Participant Index", value: "${participantIndex}" },
+            { trait_type: "Status", value: "Participant" },
           ],
         },
-      }).sendAndConfirm(umi);
-      
-      console.log("cNFT minted successfully! Signature:", signature);
+      });
     `);
     return;
   }
 
-  // Real Devnet implementation
   try {
     const { generateSigner } = await import("@metaplex-foundation/umi");
-    
-    const umi = createUmi(connection.rpcEndpoint)
-      .use(mplBubblegum());
-      
-    // Load organizer keypair in Umi format
+
+    const umi = createUmi(connection.rpcEndpoint).use(mplBubblegum());
     const umiOrganizerKeypair = umi.eddsa.createKeypairFromSecretKey(organizer.secretKey);
     umi.use(keypairIdentity(umiOrganizerKeypair));
 
-    console.log("Initializing Merkle Tree on Devnet...");
+    console.log("  Initializing Merkle Tree for participation badge...");
     const merkleTreeKeypair = generateSigner(umi);
-    
-    // Create Merkle Tree
     const treeBuilder = await createTree(umi, {
       merkleTree: merkleTreeKeypair,
       maxDepth: 14,
       maxBufferSize: 64,
       public: false,
     });
-    
     await treeBuilder.sendAndConfirm(umi);
-    console.log(`Merkle Tree initialized. Address: ${merkleTreeKeypair.publicKey}`);
+    console.log(`  Merkle Tree: ${merkleTreeKeypair.publicKey}`);
 
-    console.log("Minting cNFT to winner wallet...");
+    const mintResult = await mintV1(umi, {
+      leafOwner: publicKey(participantPubkey.toBase58()),
+      merkleTree: merkleTreeKeypair.publicKey,
+      metadata: {
+        name: `Participation Badge - ${eventName}`,
+        symbol: "PART",
+        uri: "https://arweave.net/participation-badge-metadata",
+        sellerFeeBasisPoints: 0,
+        collection: none(),
+        creators: [{ address: umi.identity.publicKey, verified: true, share: 100 }],
+        editionNonce: none(),
+        isMutable: false,
+        tokenProgramVersion: 0,
+        tokenStandard: none(),
+        uses: none(),
+      },
+    }).sendAndConfirm(umi);
+
+    console.log(`  ✅ Participation Badge cNFT minted! Sig: ${anchor.utils.bytes.hex.encode(Buffer.from(mintResult.signature))}`);
+  } catch (err) {
+    console.error("  Failed to mint participation badge cNFT:", err);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mintWinnerCNFT — minted ONLY to VRF-selected winners after resolve_winner.
+// Represents proof of winning the raffle.
+// ─────────────────────────────────────────────────────────────────────────────
+async function mintWinnerCNFT(
+  connection: Connection,
+  organizer: Keypair,
+  winnerPubkey: PublicKey,
+  eventName: string,
+  eventId: anchor.BN,
+  winnerIndex: number,
+  useDevnet: boolean
+) {
+  console.log(`\n  [cNFT:Winner] Minting Winner cNFT → ${winnerPubkey.toBase58()}`);
+
+  if (!useDevnet) {
+    console.log("  [Simulation] Localnet: Skipping live Bubblegum mint for winner cNFT.");
+    console.log("  [Simulation] On Devnet/Mainnet the following would run:");
+    console.log(`
+      mintV1(umi, {
+        leafOwner: "${winnerPubkey.toBase58()}",
+        metadata: {
+          name: "Winner Certificate - ${eventName}",
+          symbol: "WIN",
+          uri: "https://arweave.net/winner-metadata-uri",
+          attributes: [
+            { trait_type: "Event ID", value: "${eventId.toString()}" },
+            { trait_type: "Winner Index", value: "#${winnerIndex + 1}" },
+            { trait_type: "Status", value: "Winner" },
+          ],
+        },
+      });
+    `);
+    return;
+  }
+
+  try {
+    const { generateSigner } = await import("@metaplex-foundation/umi");
+
+    const umi = createUmi(connection.rpcEndpoint).use(mplBubblegum());
+    const umiOrganizerKeypair = umi.eddsa.createKeypairFromSecretKey(organizer.secretKey);
+    umi.use(keypairIdentity(umiOrganizerKeypair));
+
+    console.log("  Initializing Merkle Tree for winner cNFT...");
+    const merkleTreeKeypair = generateSigner(umi);
+    const treeBuilder = await createTree(umi, {
+      merkleTree: merkleTreeKeypair,
+      maxDepth: 14,
+      maxBufferSize: 64,
+      public: false,
+    });
+    await treeBuilder.sendAndConfirm(umi);
+    console.log(`  Merkle Tree: ${merkleTreeKeypair.publicKey}`);
+
     const mintResult = await mintV1(umi, {
       leafOwner: publicKey(winnerPubkey.toBase58()),
       merkleTree: merkleTreeKeypair.publicKey,
       metadata: {
-        name: `Raffle Winner - ${eventName}`,
-        symbol: "RAFFLE",
-        uri: "https://arweave.net/dummy-metadata-hash",
+        name: `Winner Certificate - ${eventName} #${winnerIndex + 1}`,
+        symbol: "WIN",
+        uri: "https://arweave.net/winner-certificate-metadata",
         sellerFeeBasisPoints: 0,
         collection: none(),
         creators: [{ address: umi.identity.publicKey, verified: true, share: 100 }],
         editionNonce: none(),
         isMutable: true,
-        tokenProgramVersion: 0, // TokenProgramVersion.Original
-        tokenStandard: none(), // Option<TokenStandard>
+        tokenProgramVersion: 0,
+        tokenStandard: none(),
         uses: none(),
-      }
+      },
     }).sendAndConfirm(umi);
 
-    console.log(`cNFT successfully minted on Devnet! Signature: ${anchor.utils.bytes.hex.encode(Buffer.from(mintResult.signature))}`);
+    console.log(`  ✅ Winner cNFT minted! Sig: ${anchor.utils.bytes.hex.encode(Buffer.from(mintResult.signature))}`);
   } catch (err) {
-    console.error("Failed to mint cNFT on Devnet:", err);
+    console.error("  Failed to mint winner cNFT:", err);
   }
 }
 
