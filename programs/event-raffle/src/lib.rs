@@ -18,7 +18,7 @@ pub mod event_raffle {
         let event = &mut ctx.accounts.event;
 
         require!(winner_count > 0, ErrorCode::InvalidWinnerCount);
-        require!(winner_count <= 50, ErrorCode::WinnerCountTooHigh);
+        require!(winner_count <= 500, ErrorCode::WinnerCountTooHigh);
         require!(max_participants > 0, ErrorCode::InvalidMaxParticipants);
 
         event.organizer = ctx.accounts.organizer.key();
@@ -453,7 +453,7 @@ pub struct Event {
     pub participant_count: u32,
     pub state: EventState,
     pub randomness_account: Pubkey,
-    #[max_len(50)]
+    #[max_len(500)]
     pub winners: Vec<WinnerInfo>,
 }
 
